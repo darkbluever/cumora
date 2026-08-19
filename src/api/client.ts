@@ -5,9 +5,12 @@ import type {
   CalendarReminderChannel,ComputerStatus, ComputerKind, EngineId,
 } from '@/types'
 import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
-import { HttpError } from './http-error'
+import { ApiError } from './http-error'
 
-export { HttpError, isSessionRejection } from './http-error'
+// ApiError lives in ./http-error so it can be unit-tested without the
+// renderer's module graph; re-exported here because that is where callers
+// (stores/messages, AuthGate) already import it from.
+export { ApiError, isSessionRejection } from './http-error'
 
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
@@ -125,9 +128,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
         } catch { detail = text.slice(0, 200) }
       }
     } catch { /* ignore */ }
-    // Typed, so callers can act on the STATUS. `.message` is unchanged from
-    // the plain Error this used to throw — see HttpError.
-    throw new HttpError(res.status, res.statusText, detail)
+    // Typed, so callers can act on the STATUS. The message string is
+    // unchanged from the plain Error this used to throw — the UI renders it.
+    throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
   }
   return res.json() as Promise<T>
 }
@@ -1027,10 +1030,9 @@ export const api = {
     body: string,
     attachment?: ApiAttachment | null,
     quotedMessageId?: string | null,
-    /** Optional client-supplied dedup key (the optimistic bubble's tempId).
-     *  Server echoes it on CH_MESSAGE_NEW so the renderer can match the WS
-     *  echo to its still-temp local bubble even when the WS event arrives
-     *  before this POST resolves. */
+    /** Optional client-supplied idempotency key (the optimistic bubble's
+     *  tempId). The server persists it and returns the original message when
+     *  the same send is retried. */
     clientId?: string | null,
   ) =>
     http<{ id: string; sequence: number }>(`/conversations/${encodeURIComponent(conversationId)}/messages`, {

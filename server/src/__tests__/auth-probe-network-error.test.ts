@@ -37,36 +37,39 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { HttpError, isSessionRejection } from '../../../src/api/http-error.js'
+import { ApiError, isSessionRejection } from '../../../src/api/http-error.js'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const read = (rel: string): string => readFileSync(join(ROOT, rel), 'utf8')
 
-test('HttpError carries the status the server actually sent', () => {
-  const err = new HttpError(503, 'Service Unavailable', null)
+test('ApiError carries the status the server actually sent', () => {
+  const err = new ApiError('503 Service Unavailable', 503)
   assert.equal(err.status, 503)
   assert.ok(err instanceof Error, 'every existing `catch (e)` site treats this as an Error')
 })
 
-test('HttpError keeps the message shape callers already render', () => {
-  // The UI surfaces `err.message` in toasts and inline errors. Preserve both
-  // branches of the old formatting exactly, or every error string in the app
-  // changes as a side effect of this fix.
-  assert.equal(new HttpError(404, 'Not Found', 'board not found').message, 'board not found (404)')
-  assert.equal(new HttpError(404, 'Not Found', null).message, '404 Not Found')
+test('the thrown message keeps the shape callers already render', () => {
+  // The UI surfaces `err.message` in toasts and inline errors, so the string
+  // http() builds must not change as a side effect of typing the error.
+  const client = read('src/api/client.ts')
+  assert.match(
+    client,
+    /new ApiError\(detail \? `\$\{detail\} \(\$\{res\.status\}\)` : `\$\{res\.status\} \$\{res\.statusText\}`, res\.status\)/,
+    'both branches of the original formatting must survive verbatim',
+  )
 })
 
 test('a 401 IS the server rejecting the token', () => {
   // The only clear-worthy answer. /auth/me reaches `requireAuth`, which throws
   // 401 for a missing, expired, or suspended session — so 401 covers every
   // real "you are logged out" case.
-  assert.equal(isSessionRejection(new HttpError(401, 'Unauthorized', 'authentication required')), true)
+  assert.equal(isSessionRejection(new ApiError('authentication required (401)', 401)), true)
 })
 
 // Every "must be false" case below carries the 401 control in the same test.
 // Without it a predicate that just returns false passes them all vacuously —
 // and "returns false" is exactly the shape a stub or a broken guard has.
-const CONTROL = new HttpError(401, 'Unauthorized', 'authentication required')
+const CONTROL = new ApiError('authentication required (401)', 401)
 
 test('THE regression: a rejected fetch is not a verdict on the token', () => {
   // What the browser throws when the api is not listening. No status at all —
@@ -81,7 +84,7 @@ test('a 5xx is not a verdict on the token', () => {
   // rejecting the fetch, so this is the shape the dev setup actually produces.
   for (const status of [500, 502, 503, 504]) {
     assert.equal(
-      isSessionRejection(new HttpError(status, 'boom', 'upstream died')),
+      isSessionRejection(new ApiError(`upstream died (${status})`, status)),
       false,
       `${status} means the server is broken, not that the session is`,
     )
@@ -93,7 +96,7 @@ test('a 403 is not a verdict on the token either', () => {
   // /auth/me never 403s for session reasons — requireAuth throws 401. A 403
   // would be an authorization answer about a RESOURCE, which is not grounds to
   // delete a valid session.
-  assert.equal(isSessionRejection(new HttpError(403, 'Forbidden', 'not a member')), false)
+  assert.equal(isSessionRejection(new ApiError('not a member (403)', 403)), false)
   assert.equal(isSessionRejection(CONTROL), true, 'control')
 })
 
@@ -105,7 +108,7 @@ test('the status is read from the error, never matched out of its text', () => {
   assert.equal(isSessionRejection(new Error('unauthorized (401)')), false)
   // Control, so the two above cannot pass by the predicate simply always
   // returning false.
-  assert.equal(isSessionRejection(new HttpError(401, 'Unauthorized', null)), true)
+  assert.equal(isSessionRejection(new ApiError('401 Unauthorized', 401)), true)
 })
 
 test('an unrecognizable failure keeps the session', () => {
@@ -119,7 +122,7 @@ test('an unrecognizable failure keeps the session', () => {
 
 test('http() throws the typed error, so the status survives to the caller', () => {
   const client = read('src/api/client.ts')
-  assert.match(client, /throw new HttpError\(/, 'http() must throw the typed error')
+  assert.match(client, /throw new ApiError\(/, 'http() must throw the typed error')
   assert.ok(
     !/throw new Error\(detail \?/.test(client),
     'the old untyped throw discards the status — that is what forced AuthGate to guess',

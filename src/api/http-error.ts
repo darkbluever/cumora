@@ -1,28 +1,24 @@
 /**
  * The error `http()` throws, and the one question its callers need answered:
- * did the SERVER say this token is bad, or did we simply fail to ask?
+ * did the SERVER say something authoritative, or did we simply fail to ask?
  *
  * `http()` used to throw a bare `Error` with the status baked into the message
- * string. That left `AuthGate`'s /auth/me probe unable to tell a real 401 from
- * a fetch that never reached anything, so it treated every failure as "token
- * expired" and deleted the session — logging the user out whenever the api
- * happened to be restarting. Carrying the status on the error is what makes
- * the distinction possible at all.
+ * string. Two independent call sites needed the status back out of it and could
+ * not get it — `AuthGate`'s /auth/me probe (a 401 means log out; a failed fetch
+ * does not) and `stores/messages`' send retry (a 4xx means the send is dead; a
+ * 5xx means try again). Carrying the status on the error is what makes both
+ * distinctions possible.
+ *
+ * This lives outside client.ts so it can be unit-tested without pulling in the
+ * renderer's module graph (zustand store, `@/` aliases, DOM). client.ts
+ * re-exports it, so `import { ApiError } from '@/api/client'` keeps working.
  */
 
-/** A response came back, and it was not ok. `status` is the server's, verbatim.
- *  `message` reproduces the string `http()` has always thrown, because the UI
- *  renders it in toasts and inline errors. */
-export class HttpError extends Error {
-  readonly status: number
-  /** The server's own error text when it sent one (`{error: "..."}`), else null. */
-  readonly detail: string | null
-
-  constructor(status: number, statusText: string, detail: string | null) {
-    super(detail ? `${detail} (${status})` : `${status} ${statusText}`)
-    this.name = 'HttpError'
-    this.status = status
-    this.detail = detail
+/** A response came back, and it was not ok. `status` is the server's, verbatim. */
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'ApiError'
   }
 }
 
@@ -42,5 +38,5 @@ export class HttpError extends Error {
  *  The status is read off the error object, never matched out of its text — a
  *  server message that merely mentions 401 must not be able to log anyone out. */
 export function isSessionRejection(err: unknown): boolean {
-  return err instanceof HttpError && err.status === 401
+  return err instanceof ApiError && err.status === 401
 }
