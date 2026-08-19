@@ -21,6 +21,8 @@ import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/re
 import { env } from '../env.js'
 import { redis } from '../redis.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
+import { addressingTag, hasAllMention } from './addressing.js'
+import { localHHmm, localStampTz } from './local-time.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
 import {
@@ -282,15 +284,9 @@ ${phaseGuidance}
 If you want fuller voter detail (e.g. who switched their vote), run \`cumora poll show ${brief.messageId}\`. Do not call \`cumora poll close\` here unless you genuinely want to end an open poll early.`
 }
 
-/** True iff `body` contains an `@all` broadcast token — i.e. the author is
- *  explicitly addressing everyone in the room, not just whoever they were
- *  replying to. Negative-lookahead on `[\w-]` keeps us from matching
- *  participant ids like `@allison` or `@all-team`. Case-insensitive because
- *  the picker inserts lower-case but humans paste anything. */
-const ALL_MENTION_RE = /(?<![\w@])@all(?![\w-])/i
-export function hasAllMention(body: string): boolean {
-  return ALL_MENTION_RE.test(body)
-}
+/** Re-exported for callers that only need the broadcast predicate;
+ *  `addressing.ts` owns the mention syntax for both runtimes. */
+export { hasAllMention }
 
 /** Did the LLM call fail because the upstream provider hit a rate / quota
  *  ceiling? Matches sub2api's local 429 (per-user daily ChatGPT-OAuth quota,
@@ -404,16 +400,6 @@ async function freshAttachmentUrl(att: InboxAttachment): Promise<string> {
  *  past messages so they can self-judge "I already said that". Also surfaces
  *  "rounds since last human" so agents can sense when a thread is winding
  *  down without a human re-engaging. */
-/** Format a timestamp in the server's local timezone as "HH:mm" so every
- *  agent sees the same wall-clock numbers as the user. (Was previously
- *  rendering UTC via toISOString, which caused agents to disagree about
- *  what time it actually is.) */
-function localHHmm(d: Date | string): string {
-  const date = typeof d === 'string' ? new Date(d) : d
-  const h = String(date.getHours()).padStart(2, '0')
-  const m = String(date.getMinutes()).padStart(2, '0')
-  return `${h}:${m}`
-}
 
 function cleanSystemText(value: unknown): string | null {
   if (typeof value !== 'string') return null
@@ -603,26 +589,21 @@ function renderContext(
           : m.body.slice(0, 400).replace(/\n/g, ' \\n ')
       const tag = m.is_self ? '▸ME' : '   '
       let line = `  [${m.id}] ${tag} ${t}  ${m.author_name}: ${body}`
-      // Inline broadcast tag — same line so the LLM can't miss it while
-      // skimming, and so a flurry of replies underneath doesn't visually
-      // separate the @all flag from the message it belongs to.
-      if (!m.is_self && m.kind !== 'system' && hasAllMention(m.body)) {
-        line += `  📣 [broadcast: @all]`
-      }
-      // Quote-direction tag — same line, right next to the body so a
-      // peer-eavesdropping agent can't miss that this message is
-      // directed at someone specific. The point: in groups, a
-      // quote-reply is a soft 1:1 address. Agents who aren't the
-      // quote target keep treating it as a general group message and
-      // chime in unprompted; this puts the address signal in the
-      // glance-zone of the wake prompt.
-      if (m.quoted_message_id && m.quoted && !m.is_self) {
-        if (viewerAgentId && m.quoted.authorId === viewerAgentId) {
-          line += `  ↦ addressed to YOU (quote-reply)`
-        } else {
-          line += `  ↦ addressed to ${m.quoted.authorName} (quote-reply — not you; stay quiet unless your angle differs)`
-        }
-      }
+      // Addressing tag — same line, right next to the body so a
+      // peer-eavesdropping agent can't miss that this message is directed at
+      // someone specific, and so a flurry of replies underneath can't
+      // visually separate the signal from the message it belongs to.
+      // Shared with the BYOA daemon (see agents/addressing.ts): an explicitly
+      // typed @name outranks the quote it hangs off, which is the case the old
+      // quote-only tag got exactly backwards.
+      line += addressingTag({
+        viewerAgentId,
+        body: m.body,
+        quotedAuthorId: m.quoted_message_id && m.quoted ? m.quoted.authorId : null,
+        quotedAuthorName: m.quoted?.authorName ?? null,
+        isSelf: m.is_self,
+        kind: m.kind,
+      })
       if (m.reactions && m.reactions.length > 0) {
         const summary = m.reactions
           .map((r) => `${r.emoji}×${r.users.length} (${r.users.join(', ')})`)
@@ -2058,10 +2039,11 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
 
   // Single source of truth for "what time is it" — every timestamp in the
   // wake prompt is rendered in this same local timezone, so agents agree on
-  // the wall clock and don't disagree about what time it is.
+  // the wall clock and don't disagree about what time it is. `local-time.ts`
+  // is shared with the agent CLI so a `cumora calendar list` and this line
+  // can't report the same instant 8 hours apart.
   const now = new Date()
-  const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone
-  const nowStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')} ${localHHmm(now)} (${tzName})`
+  const nowStr = localStampTz(now)
 
   // ─── In-flight peer work ──────────────────────────────────────────
   // Read the tenant-scoped worklog so the agent SEES what peers are

@@ -14,6 +14,7 @@ import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage
 import { env } from '../env.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
 import { stripLoneSurrogates } from './text-safety.js'
+import { localStamp, localStampTz, localTzName, parseLocalTimestamp } from './local-time.js'
 
 // Every CLI result flows through ok()/err(), so scrubbing lone UTF-16 surrogates
 // here means CLI output (read by agents as tool results) can never carry a split
@@ -154,7 +155,7 @@ MAILBOX  (this is how you receive + send messages):
   ack <convo_id>                    — mark that conversation read up to NOW (clear from inbox)
   ack --all                         — ack every conversation currently in your inbox
   mute <convo_id> [--for 1h|1d|1w] — stop delivery from a group (direct @mentions and quote-replies still arrive)
-  mute <convo_id> --until <iso>     — stop delivery until a wall-clock time; omit duration to mute forever
+  mute <convo_id> --until <when>    — stop delivery until a wall-clock time (YOUR local time, e.g. "2026-05-25 18:00"); omit duration to mute forever
   mute list                         — show your active muted groups and expiry times
   follow <convo_id>                 — resume normal delivery from a muted group
   ship list                         — list feature contracts and evidence-square progress
@@ -214,13 +215,16 @@ CALENDAR  (shared schedule + your own self-scheduling tool):
   # promising to come back, schedule the wake so future-you actually does.
   calendar list [--as <id>] [--all] [--status active|paused|done|cancelled]
                                    # default scope = events assigned to OR created by --as
-  calendar create "<title>" --at <iso> [--assignee <id>] [--prompt "..."]
+  calendar create "<title>" --at <when> [--assignee <id>] [--prompt "..."]
                                        [--in <convo_id>] [--every daily|weekly|monthly|yearly]
                                        [--interval N] [--byweekday 0,1,2,3,4]
-                                       [--until <iso>] [--count N]
+                                       [--until <when>] [--count N]
                                        [--kind personal|agent_task]
                                        [--remind <minutes>] [--remind-channel toast|email|both]
                                        [--private]
+                                   # --at takes YOUR LOCAL wall clock: "2026-05-25 15:00"
+                                   #   or "2026-05-25" (= local midnight). Add an explicit
+                                   #   offset (…T15:00:00Z, …+05:30) only if you mean UTC.
                                    # --assignee <self_id> + --prompt "..." = give future-you
                                    #   a wake-up with that prompt as the brief
                                    # --every daily|weekly|monthly|yearly = recurring schedule;
@@ -232,7 +236,7 @@ CALENDAR  (shared schedule + your own self-scheduling tool):
                                    #   you don't want to clutter the shared calendar.
                                    # when start_at fires, the prompt is posted into <convo_id>
                                    # (or the assignee's DM with you) and the assignee is woken
-  calendar update <event_id> [--title "..."] [--at <iso>] [--status active|cancelled|done]
+  calendar update <event_id> [--title "..."] [--at <when>] [--status active|cancelled|done]
                              [--private | --public]                # flip the privacy flag
   calendar run-now <event_id>      # dispatch an event immediately
   calendar dispatches <event_id>   # inspect dispatch history
@@ -391,8 +395,8 @@ EXAMPLES:
   bash: opencli browser "$CUMORA_AGENT_ID" open https://example.com
   cumora image generate "a quiet bauhaus poster, ochre and cobalt" --size wide
   cumora tasks list --as bram --status open
-  cumora calendar create "Follow up with Wei on hero v3" --at 2026-05-25T15:00:00Z --assignee iris --prompt "DM wei and ask if v3 landed"     # one-shot self-schedule
-  cumora calendar create "Daily standup digest" --at 2026-05-24T09:00:00Z --assignee iris --prompt "Summarize yesterday's group activity and post into <convo_id>" --every daily     # recurring self-schedule
+  cumora calendar create "Follow up with Wei on hero v3" --at "2026-05-25 15:00" --assignee iris --prompt "DM wei and ask if v3 landed"     # one-shot self-schedule (15:00 YOUR time)
+  cumora calendar create "Daily standup digest" --at "2026-05-24 09:00" --assignee iris --prompt "Summarize yesterday's group activity and post into <convo_id>" --every daily     # recurring self-schedule
   cumora calendar list --as iris                                          # see what you've already scheduled for yourself`,
   )
 }
@@ -1048,8 +1052,8 @@ function parseMuteUntil(parsed: ParsedArgs): Date | null {
   const forRaw = typeof parsed.flags.for === 'string' ? parsed.flags.for : null
   if (untilRaw && forRaw) throw new Error('use either --until or --for, not both')
   if (untilRaw) {
-    const until = new Date(untilRaw)
-    if (Number.isNaN(until.getTime())) throw new Error('invalid --until timestamp')
+    const until = parseLocalTimestamp(untilRaw)
+    if (!until) throw new Error('invalid --until timestamp')
     if (until.getTime() <= Date.now()) throw new Error('--until must be in the future')
     return until
   }
@@ -1078,10 +1082,10 @@ async function cmdMute(parsed: ParsedArgs): Promise<CliResult> {
     )
     if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
     if (rows.length === 0) return ok('(no muted groups)')
-    return ok(rows.map((row) => `• ${row.id}  "${row.title}"  — ${row.muted_until ? `until ${new Date(row.muted_until).toISOString()}` : 'until you follow it'}`).join('\n'))
+    return ok(rows.map((row) => `• ${row.id}  "${row.title}"  — ${row.muted_until ? `until ${localStampTz(row.muted_until)}` : 'until you follow it'}`).join('\n'))
   }
   const conversationId = parsed.positional[0]
-  if (!conversationId) return err('usage: mute <conversation_id> [--for 30m|2h|1d|1w] [--until <iso>]  OR  mute list')
+  if (!conversationId) return err('usage: mute <conversation_id> [--for 30m|2h|1d|1w] [--until <when>]  OR  mute list')
   let until: Date | null
   try { until = parseMuteUntil(parsed) } catch (error) { return err(error instanceof Error ? error.message : String(error)) }
   const { rows } = await pool.query<{ kind: string; title: string; members: string[] }>(
@@ -1118,7 +1122,7 @@ async function cmdMute(parsed: ParsedArgs): Promise<CliResult> {
     client.release()
   }
   void clearHold(me, `reply:${conversationId}`)
-  const expiry = until ? ` until ${until.toISOString()}` : ' until you follow it again'
+  const expiry = until ? ` until ${localStampTz(until)}` : ' until you follow it again'
   return ok(
     `Muted ${conversationId} ("${conversation.title}")${expiry}. ` +
     `New group messages will not wake you or enter your inbox. A direct @${me} mention or a reply quoting your message still gets through. ` +
@@ -2944,7 +2948,7 @@ async function cmdEmailInbox(parsed: ParsedArgs, me: string, companyId: string):
     const subject = t.last_subject ?? t.title ?? '(no subject)'
     const from = t.last_from ?? '?'
     const snippet = (t.last_body ?? '').slice(0, 240).replace(/\n+/g, ' \\n ')
-    const at = t.last_at ? new Date(t.last_at).toISOString().replace('T', ' ').slice(0, 16) : ''
+    const at = t.last_at ? localStamp(t.last_at) : ''
     lines.push(`# ${t.conversation_id}${unreadTag}  [${at}]`)
     lines.push(`  from:    ${from}`)
     lines.push(`  subject: ${subject}`)
@@ -2988,7 +2992,7 @@ async function cmdEmailShow(parsed: ParsedArgs, me: string, companyId: string): 
   if (msgs.length === 0) return ok(`(thread ${convoId} has no email messages)`)
   const lines: string[] = [`thread ${convoId}  "${cv[0].title}"`, '']
   for (const m of msgs) {
-    const at = new Date(m.created_at).toISOString().replace('T', ' ').slice(0, 16)
+    const at = localStamp(m.created_at)
     const arrow = m.direction === 'in' ? '↓ in' : '↑ out'
     lines.push(`────  [${m.id}]  ${arrow}  ${m.transport_status}  ${at}`)
     lines.push(`from:    ${m.from_addr}`)
@@ -4108,28 +4112,32 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
     if (rows.length === 0) return ok(`(no calendar events for ${me}${all ? ' [workspace]' : ''})`)
     return ok([
-      `${rows.length} calendar event(s)${all ? ' in workspace' : ` for ${me}`}:`,
+      `${rows.length} calendar event(s)${all ? ' in workspace' : ` for ${me}`} · times in ${localTzName()}:`,
       '',
       ...rows.map((r) => {
         const rep = r.recurrence ? `every ${r.recurrence.interval || 1} ${r.recurrence.freq}` : 'one-shot'
         const who = r.assignee_id ? ` → @${r.assignee_id}` : ''
         const lock = r.is_private ? ' 🔒' : ''
-        return `  [${r.status.padEnd(7)}] ${r.id.slice(0, 14).padEnd(15)} ${r.start_at.toISOString().slice(0, 16)} · ${rep}${who}${lock}  ${r.title}`
+        return `  [${r.status.padEnd(7)}] ${r.id.slice(0, 14).padEnd(15)} ${localStamp(r.start_at)} · ${rep}${who}${lock}  ${r.title}`
       }),
     ].join('\n'))
   }
 
   if (op === 'create') {
-    // usage: calendar create "<title>" --at <iso> [--assignee <id>] [--prompt "..."]
+    // usage: calendar create "<title>" --at <when> [--assignee <id>] [--prompt "..."]
     //                                  [--in <convo_id>] [--every daily|weekly|monthly|yearly]
-    //                                  [--interval N] [--byweekday 0,1,2] [--until <iso>] [--count N]
+    //                                  [--interval N] [--byweekday 0,1,2] [--until <when>] [--count N]
     //                                  [--kind personal|agent_task]
     const title = parsed.positional.slice(1).join(' ').trim()
-    if (!title) return err('usage: calendar create "<title>" --at <iso> [flags]')
+    if (!title) return err('usage: calendar create "<title>" --at <when> [flags]')
     const startStr = parsed.flags.at ? String(parsed.flags.at) : ''
-    if (!startStr) return err('--at <iso-timestamp> is required')
-    const start = new Date(startStr)
-    if (Number.isNaN(start.getTime())) return err(`invalid --at: ${startStr}`)
+    if (!startStr) return err('--at <when> is required (e.g. "2026-08-20 09:00" — your local time)')
+    // Local-first parse: a bare `2026-08-20` or `2026-08-20 09:00` means that
+    // wall-clock time WHERE YOU ARE, not UTC. `new Date()` alone would read a
+    // date-only string as UTC midnight and an offset-less date-time as local —
+    // two different instants for what an agent means as the same day.
+    const start = parseLocalTimestamp(startStr)
+    if (!start) return err(`invalid --at: ${startStr}`)
     const assigneeId = parsed.flags.assignee ? String(parsed.flags.assignee) : null
     const agentPrompt = parsed.flags.prompt ? String(parsed.flags.prompt) : null
     const targetConvo = parsed.flags.in ? String(parsed.flags.in) : null
@@ -4225,7 +4233,7 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
          reminderMinutes, reminderChannel, isPrivate],
       )
       await publishCalendarCli({ companyId, kind: 'event.created', eventId: id, actorId: me })
-      return ok(`scheduled ${id}: "${title}" at ${start.toISOString()}${recurrence ? ` · every ${recurrence.interval} ${recurrence.freq}` : ''}${assigneeId ? ` → @${assigneeId}` : ''}${reminderMinutes != null ? ` · remind ${reminderMinutes}m before (${reminderChannel})` : ''}${isPrivate ? ' · 🔒 private' : ''}`, [{
+      return ok(`scheduled ${id}: "${title}" at ${localStampTz(start)}${recurrence ? ` · every ${recurrence.interval} ${recurrence.freq}` : ''}${assigneeId ? ` → @${assigneeId}` : ''}${reminderMinutes != null ? ` · remind ${reminderMinutes}m before (${reminderChannel})` : ''}${isPrivate ? ' · 🔒 private' : ''}`, [{
         event: 'calendar.event_created',
         command: 'calendar create',
         calendarEventId: id,
@@ -4248,7 +4256,7 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
 
   if (op === 'update' || op === 'edit') {
     const id = parsed.positional[1]
-    if (!id) return err(`usage: calendar ${op} <event_id> [--title "..."] [--at <iso>] [--status active|cancelled|done] [flags]`)
+    if (!id) return err(`usage: calendar ${op} <event_id> [--title "..."] [--at <when>] [--status active|cancelled|done] [flags]`)
     // Privacy guard: same visibility rule as list. Callers who can't see
     // the row can't modify it. The check is folded into the UPDATE so we
     // don't pay an extra round trip.
@@ -4292,16 +4300,18 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
       push('target_conversation_id', !target || target === 'null' || target === '-' ? null : target)
     }
     if (parsed.flags.at !== undefined) {
-      const start = new Date(String(parsed.flags.at))
-      if (Number.isNaN(start.getTime())) return err(`invalid --at: ${parsed.flags.at}`)
+      // Same local-first parse as `calendar create` — `--at` must mean the
+      // same instant on both subcommands.
+      const start = parseLocalTimestamp(String(parsed.flags.at))
+      if (!start) return err(`invalid --at: ${parsed.flags.at}`)
       push('start_at', start)
     }
     if (parsed.flags.end !== undefined) {
       const raw = String(parsed.flags.end).trim()
       if (!raw || raw === 'null' || raw === '-') push('end_at', null)
       else {
-        const end = new Date(raw)
-        if (Number.isNaN(end.getTime())) return err(`invalid --end: ${raw}`)
+        const end = parseLocalTimestamp(raw)
+        if (!end) return err(`invalid --end: ${raw}`)
         push('end_at', end)
       }
     }
@@ -4365,7 +4375,7 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     const row = rows[0]
     if (!row) return err(`no event ${id}`)
     await publishCalendarCli({ companyId, kind: 'event.updated', eventId: id, actorId: me })
-    return ok(`updated ${id}: "${row.title}" at ${row.start_at.toISOString()} (${row.status})`, [{
+    return ok(`updated ${id}: "${row.title}" at ${localStampTz(row.start_at)} (${row.status})`, [{
       event: 'calendar.event_updated',
       command: `calendar ${op}`,
       calendarEventId: id,
@@ -4429,10 +4439,10 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
     if (rows.length === 0) return ok(`(no dispatches for ${id})`)
     return ok([
-      `${rows.length} dispatch(es) for ${id}:`,
+      `${rows.length} dispatch(es) for ${id} · times in ${localTzName()}:`,
       '',
       ...rows.map((r) =>
-        `  [${r.status}] ${r.scheduled_for.toISOString()} → ${r.conversation_id ?? '-'} ${r.message_id ?? ''}${r.error ? ` · ${r.error}` : ''}`,
+        `  [${r.status}] ${localStamp(r.scheduled_for)} → ${r.conversation_id ?? '-'} ${r.message_id ?? ''}${r.error ? ` · ${r.error}` : ''}`,
       ),
     ].join('\n'))
   }

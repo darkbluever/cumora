@@ -30,6 +30,8 @@ import { parseSseStream } from '../runtime/sse-parse.js'
 import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
+import { addressingTag } from '../addressing.js'
+import { localStampTz } from '../local-time.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 
@@ -317,6 +319,18 @@ interface RuntimeInboxResponse {
     body?: string
     kind?: string
     sequence?: number
+    /** Set when the message is a quote-reply. The `/inbox` SQL has always
+     *  returned these two; the daemon just used to drop them, which is why a
+     *  BYOA agent saw no addressing signal at all. */
+    quoted_message_id?: string | null
+    quoted?: {
+      id?: string
+      authorId?: string
+      authorName?: string
+      kind?: string
+      body?: string
+      sequence?: number
+    } | null
   }>
 }
 
@@ -1354,7 +1368,19 @@ class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      lines.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
+      // The addressing tag rides on the same line, from the same module the
+      // cloud path uses (agents/addressing.ts). Without it a BYOA agent read
+      // `author: body` and nothing else — and since a human message
+      // hard-bypasses the cheap triage gate, that meant every peer reached its
+      // big brain with no idea the question named someone else.
+      const addressed = addressingTag({
+        viewerAgentId: this.agent.id,
+        body: row.kind === 'system' ? '' : (row.body ?? ''),
+        quotedAuthorId: row.quoted?.authorId ?? null,
+        quotedAuthorName: row.quoted?.authorName ?? null,
+        kind: row.kind,
+      })
+      lines.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${addressed}`)
     }
     const digest = lines.length ? lines.slice(-40).join('\n') : ''
     return { seen, digest, hasReal }
@@ -1460,7 +1486,10 @@ class AgentRunner {
       // lands in the past: a werewolf judge scheduled every phase alarm ~20
       // minutes before "now" and they all fired instantly. One line, per
       // turn, always current.
-      `Current time (UTC): ${new Date().toISOString()} — use this for any --at / deadline math.\n\n` +
+      // LOCAL, not UTC: the cloud wake prompt renders local and `--at` now
+      // parses as local, so a UTC clock here would put every deadline the
+      // engine computes off by the host's offset.
+      `Current time: ${localStampTz(new Date())} — use this for any --at / deadline math (same wall clock the CLI prints and accepts).\n\n` +
       (triageNote ? `${triageNote}\n\n` : ``) +
       (inboxDigest
         // Pre-loaded unread (fetched for you) — mirrors how the cloud agent gets
@@ -1477,7 +1506,7 @@ class AgentRunner {
    *  invariant mechanics live in the standing prompt. */
   private agendaDelta(brief: string, memoryDigest: string, roster?: string): string {
     return (
-      `Current time (UTC): ${new Date().toISOString()} — use this for any --at / deadline math.\n\n` +
+      `Current time: ${localStampTz(new Date())} — use this for any --at / deadline math (same wall clock the CLI prints and accepts).\n\n` +
       `You've been woken by your OWN AGENDA — Kanban cards assigned to you (or @-mentioning you), calendar slots due now, ` +
       `AND any conversation you're in that went quiet mid-flow and needs follow-up. The system already triaged that there's ` +
       `real work to progress, so ACT: pick the most timely item and move it forward; don't deliberate whether to. For a quiet ` +
