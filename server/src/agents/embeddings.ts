@@ -1,5 +1,5 @@
 /**
- * Memory embeddings via OpenAI's `text-embedding-3-small` (1536-dim).
+ * Memory embeddings — 1536-dim vectors, `text-embedding-3-small` by default.
  *
  * Used by:
  *   - `cumora memory note` — embeds the body at write time and stores
@@ -8,23 +8,51 @@
  *     context at wake time so the retriever can pull semantically
  *     relevant memories alongside pinned + most-recent.
  *
+ * The embeddings channel is configured INDEPENDENTLY of the agent/chat
+ * channel (EMBEDDING_BASE_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL).
+ * Plenty of OpenAI-compatible gateways proxy `/v1/responses` but serve no
+ * `/v1/embeddings` route, so a deployment pointing OPENAI_BASE_URL at such a
+ * gateway would silently lose semantic memory. Passing baseURL explicitly is
+ * what shields this client from OPENAI_BASE_URL; leaving EMBEDDING_BASE_URL
+ * empty keeps the old behavior (SDK resolves OPENAI_BASE_URL → api.openai.com).
+ *
  * All calls are best-effort: if the API hiccups or the input is
  * empty/oversized, we return `null` and the caller falls back to
- * recency-only retrieval. That way a transient OpenAI outage doesn't
+ * recency-only retrieval. That way a transient outage doesn't
  * break the entire wake cycle.
  */
 import OpenAI from 'openai'
 import { env } from '../env.js'
 import { pool } from '../db/pool.js'
 
-const EMBED_MODEL = 'text-embedding-3-small'
+const EMBED_MODEL = env.EMBEDDING_MODEL
+/** Must match `agent_workspace.embedding vector(1536)` in db/migrate.ts.
+ *  A model with a different native width is rejected below rather than
+ *  written, so retrieval degrades instead of corrupting the column. */
 const EMBED_DIM = 1536
 /** OpenAI accepts up to ~8K tokens per input; we cap at 8K characters
  *  (~2K tokens) which is plenty for a single memory entry or a few
  *  recent inbox messages. */
 const MAX_INPUT_CHARS = 8000
 
-const client = new OpenAI({ apiKey: env.OPENAI_API_KEY })
+/** Resolve the embeddings client's credentials from config. Pure + exported so
+ *  the fallback chain is testable without constructing a real OpenAI client
+ *  (the module-level `client` below is built once, at import time).
+ *
+ *  `baseURL` is `undefined` — not `''` — when unset, because the SDK only
+ *  consults its own OPENAI_BASE_URL → api.openai.com chain for an absent
+ *  option; an empty string would be taken as a literal base and break every
+ *  request. That distinction is the whole backward-compatibility contract. */
+export function resolveEmbeddingClientOptions(
+  cfg: { EMBEDDING_API_KEY: string; EMBEDDING_BASE_URL: string; OPENAI_API_KEY: string },
+): { apiKey: string; baseURL: string | undefined } {
+  return {
+    apiKey: cfg.EMBEDDING_API_KEY || cfg.OPENAI_API_KEY,
+    baseURL: cfg.EMBEDDING_BASE_URL || undefined,
+  }
+}
+
+const client = new OpenAI(resolveEmbeddingClientOptions(env))
 
 /** Test-only override. When set, every {@link embedText} call returns
  *  whatever this function produces — bypassing the real OpenAI

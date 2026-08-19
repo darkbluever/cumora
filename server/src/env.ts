@@ -83,6 +83,31 @@ export const env = {
   ALERT_DEDUPE_MS: Number(process.env.ALERT_DEDUPE_MS ?? 60_000),
   /** Image model for avatar generation. Override with OPENAI_IMAGE_MODEL. */
   OPENAI_IMAGE_MODEL: process.env.OPENAI_IMAGE_MODEL ?? 'gpt-image-2',
+  /**
+   * Memory embeddings channel — deliberately separate from the chat/agent
+   * channel. Many OpenAI-compatible gateways proxy `/v1/responses` and
+   * `/v1/chat/completions` but serve NO `/v1/embeddings` route at all, so a
+   * deployment that redirects everything with `OPENAI_BASE_URL` would lose
+   * semantic memory. Set these to keep embeddings on a provider that does
+   * serve them (OpenAI direct, OpenRouter, a local model server, …) while
+   * the agent loop stays on the gateway.
+   *
+   * When EMBEDDING_BASE_URL is empty the client passes no baseURL, which
+   * preserves the historical behavior exactly: the OpenAI SDK falls back to
+   * OPENAI_BASE_URL, then to api.openai.com.
+   *
+   * EMBEDDING_MODEL must produce 1536-dim vectors to match the
+   * `agent_workspace.embedding vector(1536)` column; anything else is
+   * rejected by the length guard in agents/embeddings.ts and degrades to
+   * recency-only retrieval.
+   *
+   * e.g. EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
+   *      EMBEDDING_API_KEY=sk-or-v1-…
+   *      EMBEDDING_MODEL=openai/text-embedding-3-small
+   */
+  EMBEDDING_BASE_URL: process.env.EMBEDDING_BASE_URL ?? '',
+  EMBEDDING_API_KEY: process.env.EMBEDDING_API_KEY ?? '',
+  EMBEDDING_MODEL: process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small',
   /** Background scanner cadence */
   SCANNER_INTERVAL_MS: Number(process.env.SCANNER_INTERVAL_MS ?? 90_000),
   /**

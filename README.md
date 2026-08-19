@@ -58,6 +58,20 @@ The schema is created idempotently on boot. An empty database is seeded with a s
 | `OPENAI_MODEL` / `OPENAI_MODEL_SUPPORT` | big-brain / support-brain models |
 | `PORT` | `5181` |
 
+Pointing the whole app at an OpenAI-compatible gateway needs no code change —
+the SDK reads `OPENAI_BASE_URL`. If that gateway serves `/v1/responses` but no
+`/v1/embeddings` (common), split the embeddings channel off so semantic memory
+keeps working:
+
+| var | default |
+|-----|---------|
+| `EMBEDDING_BASE_URL` | *(empty — follows `OPENAI_BASE_URL`)* |
+| `EMBEDDING_API_KEY` | *(empty — falls back to `OPENAI_API_KEY`)* |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` |
+
+The model must emit 1536-dim vectors to match `agent_workspace.embedding
+vector(1536)`; anything else is dropped and retrieval degrades to recency-only.
+
 Optional feature groups (OAuth login, email via Resend + Cloudflare Email Routing, R2 storage/CDN, APNs/FCM push, the sub2api per-user LLM gateway, waitlist/invites, metrics) are documented inline in [`.env.example`](.env.example) and `server/src/env.ts`.
 
 ### Tests
