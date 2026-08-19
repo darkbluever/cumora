@@ -116,3 +116,66 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
     assert.equal(r.shell, true, '.cmd must run via the shell')
     assert.equal(r.wantsStdinPrompt, true, '.cmd needs the big prompt via stdin')
   })
+
+// Regression: doctor's small-tier probe hardcoded 'haiku' / 'gpt-5.4-mini' while
+// the daemon's triage path already honored CUMORA_TRIAGE_MODEL (daemon.ts, both
+// the classify() call and triageModel()'s cost-ledger pricing). On a provider
+// that names its models differently, doctor therefore probed a model triage
+// never runs on — reporting a red small brain the wake path never hits, or a
+// green one when the real triage model is broken. probe() must spawn the SAME
+// model as triage.
+//
+// The fake engine echoes its argv so the assertion is on what was actually
+// spawned, not on a mock's bookkeeping.
+async function probeArgv(engine: 'claude' | 'codex', tier: 'big' | 'small'): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), `cumora-probe-${engine}-`))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const cwd = join(root, 'cwd')
+  await mkdir(binDir)
+  await mkdir(cwd)
+  const fake = join(binDir, engine)
+  await writeFile(fake, '#!/bin/sh\necho "$@"\n', 'utf8')
+  await chmod(fake, 0o755)
+  const res = await getAdapter(engine).probe({
+    tier,
+    cwd,
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    signal: new AbortController().signal,
+  })
+  return res.text
+}
+
+test('probe small tier spawns CUMORA_TRIAGE_MODEL, big tier stays on the default', { skip: IS_WIN }, async () => {
+  const saved = process.env.CUMORA_TRIAGE_MODEL
+  process.env.CUMORA_TRIAGE_MODEL = 'triage-model-under-test'
+  try {
+    const claudeSmall = await probeArgv('claude', 'small')
+    assert.match(claudeSmall, /--model triage-model-under-test/)
+    assert.doesNotMatch(claudeSmall, /--model haiku/)
+
+    const codexSmall = await probeArgv('codex', 'small')
+    assert.match(codexSmall, /--model triage-model-under-test/)
+    assert.doesNotMatch(codexSmall, /gpt-5\.4-mini/)
+
+    // 'big' means "whatever the engine's own default is" — passing --model here
+    // would pin the main brain to the triage model and make the big-tier probe
+    // a duplicate of the small one.
+    assert.doesNotMatch(await probeArgv('claude', 'big'), /--model/)
+    assert.doesNotMatch(await probeArgv('codex', 'big'), /--model/)
+  } finally {
+    if (saved === undefined) delete process.env.CUMORA_TRIAGE_MODEL
+    else process.env.CUMORA_TRIAGE_MODEL = saved
+  }
+})
+
+test('probe small tier falls back to the engine cerebellum when unset', { skip: IS_WIN }, async () => {
+  const saved = process.env.CUMORA_TRIAGE_MODEL
+  delete process.env.CUMORA_TRIAGE_MODEL
+  try {
+    assert.match(await probeArgv('claude', 'small'), /--model haiku/)
+    assert.match(await probeArgv('codex', 'small'), /--model gpt-5\.4-mini/)
+  } finally {
+    if (saved !== undefined) process.env.CUMORA_TRIAGE_MODEL = saved
+  }
+})

@@ -829,10 +829,13 @@ class ClaudeAdapter implements EngineAdapter {
 
   probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
     // Mirror classify's clean one-shot spawn, but pick the tier's model: 'small'
-    // → haiku (the cerebellum); 'big' → omit --model so Claude uses its DEFAULT
-    // (the main reasoning brain). One token in, "OK" out — proves the binary runs
-    // and that tier is authed/has quota, with NO tools/MCP/persona.
-    const model = args.tier === 'small' ? ['--model', 'haiku'] : []
+    // → the cerebellum (haiku, or CUMORA_TRIAGE_MODEL when the operator's
+    // provider names its models differently — the doctor must probe the model
+    // triage ACTUALLY runs on, else it reports a failure the wake path never
+    // hits); 'big' → omit --model so Claude uses its DEFAULT (the main
+    // reasoning brain). One token in, "OK" out — proves the binary runs and
+    // that tier is authed/has quota, with NO tools/MCP/persona.
+    const model = args.tier === 'small' ? ['--model', process.env.CUMORA_TRIAGE_MODEL || 'haiku'] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const base = ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
@@ -1260,10 +1263,11 @@ class CodexAdapter implements EngineAdapter {
   }
 
   probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
-    // 'small' → gpt-5.4-mini (the cerebellum); 'big' → omit --model so Codex uses
-    // its default model. `exec` non-interactive, no bypass/sandbox flags needed
-    // for a tool-free one-token reply.
-    const model = args.tier === 'small' ? ['--model', 'gpt-5.4-mini'] : []
+    // 'small' → gpt-5.4-mini, or CUMORA_TRIAGE_MODEL when set (probe the model
+    // triage ACTUALLY runs on — see the claude adapter's probe); 'big' → omit
+    // --model so Codex uses its default model. `exec` non-interactive, no
+    // bypass/sandbox flags needed for a tool-free one-token reply.
+    const model = args.tier === 'small' ? ['--model', process.env.CUMORA_TRIAGE_MODEL || 'gpt-5.4-mini'] : []
     const { command, shell } = resolveSpawn(this.bin)
     const argv = ['exec', ...model, '--skip-git-repo-check', DOCTOR_PROMPT]
     return spawnCapture(command, argv, {

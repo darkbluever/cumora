@@ -364,7 +364,10 @@ npx cumora@latest agent computer --pair <code> [--server <url>]
   (launchd `io.cumora.daemon` on macOS, `systemd --user` on Linux) so it
   survives reboots and — on macOS — runs in the GUI domain where the
   engine's keychain-backed login actually works.
-- `--doctor` probes the big/small models and the wake path end-to-end.
+- `--doctor` probes the big/small models and the wake path end-to-end. The
+  small-tier probe honors `CUMORA_TRIAGE_MODEL`, so it exercises the model
+  triage actually runs on rather than a hardcoded default the wake path
+  would never reach.
 - In-repo dev uses `./bin/cumora agent computer …` (tsx) — the same
   code, unbundled.
 
