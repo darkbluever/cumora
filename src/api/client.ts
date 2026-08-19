@@ -5,6 +5,9 @@ import type {
   CalendarReminderChannel,ComputerStatus, ComputerKind, EngineId,
 } from '@/types'
 import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
+import { HttpError } from './http-error'
+
+export { HttpError, isSessionRejection } from './http-error'
 
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
@@ -122,7 +125,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
         } catch { detail = text.slice(0, 200) }
       }
     } catch { /* ignore */ }
-    throw new Error(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`)
+    // Typed, so callers can act on the STATUS. `.message` is unchanged from
+    // the plain Error this used to throw — see HttpError.
+    throw new HttpError(res.status, res.statusText, detail)
   }
   return res.json() as Promise<T>
 }
