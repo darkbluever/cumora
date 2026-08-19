@@ -146,9 +146,17 @@ export async function seedIfEmpty(): Promise<void> {
     }
 
     for (const c of SEED_CONVOS) {
+      // company_id MUST be written here, not left to migrate.ts's
+      // `UPDATE conversations SET company_id = 'personal' WHERE company_id IS NULL`
+      // backfill. That backfill runs in ensureSchema(), i.e. BEFORE seedIfEmpty()
+      // in the same boot (index.ts), so a row inserted without it stays NULL for
+      // the rest of that process lifetime. Every direct-DM dedup query filters on
+      // `company_id = $1`, and `NULL = 'personal'` is NULL — so onboardStarterAgents
+      // could not see these rows and created a duplicate `direct-<id>-<hex>` for
+      // every agent, giving the user two DM entries per agent in the sidebar.
       await client.query(
-        `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, pulled_by, project_id)
-         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9)`,
+        `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, pulled_by, project_id, company_id)
+         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9,'personal')`,
         [c.id, c.kind, c.title, c.subtitle ?? null, JSON.stringify(c.members), c.pinned ?? false, c.tag ?? null, c.pulledBy ? JSON.stringify(c.pulledBy) : null, c.projectId ?? null],
       )
       const maxSeq = SEED_MESSAGES.filter((m) => m.conversationId === c.id).reduce((a, b) => Math.max(a, b.sequence), 0)
@@ -160,8 +168,8 @@ export async function seedIfEmpty(): Promise<void> {
 
     for (const m of SEED_MESSAGES) {
       await client.query(
-        `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, reactions, tool, attachment)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb)`,
+        `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, reactions, tool, attachment, company_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9::jsonb,'personal')`,
         [m.id, m.conversationId, m.authorId, m.kind, m.body, m.sequence,
           m.reactions ? JSON.stringify(m.reactions) : null,
           m.tool ? JSON.stringify(m.tool) : null,
