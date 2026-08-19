@@ -382,30 +382,74 @@ async function api<T>(serverUrl: string, path: string, init: RequestInit): Promi
   return res.json() as Promise<T>
 }
 
+/**
+ * A source of currently-valid agent runtime JWTs.
+ *
+ * Runtime calls take THIS, never a token string. A BYOA turn can outlive the
+ * token it started with (2h TTL vs. turns that legitimately run longer), so a
+ * captured-by-value token silently rots mid-turn: every `/typing`, `/status`,
+ * `/runs/<id>/heartbeat` and `/runs/<id>/finish` starts 401ing, the run stops
+ * being heartbeaten, and the server's 10-min stale-run sweeper reaps a
+ * perfectly healthy turn as `failed / stage='orphaned'`. Resolving the token
+ * per call — and invalidating on a 401 so the next call re-mints — is what
+ * keeps a long turn observable.
+ */
+export interface TokenSource {
+  /** The token to use right now (re-mints when near expiry). */
+  get(): Promise<string>
+  /** The server just rejected our token; drop it so `get()` re-mints. */
+  invalidate(): void
+}
+
+/**
+ * One runtime request with fresh auth and a single 401 retry.
+ *
+ * The retry is what makes an outstanding token failure self-healing: whether it
+ * expired mid-turn or the server restarted with a different
+ * AGENT_RUNTIME_SECRET, the first 401 invalidates the cached token and the
+ * second attempt carries a freshly minted one. Without it a 401 is permanent
+ * until the cache happens to expire on its own.
+ *
+ * Exported for the regression test that pins the retry (agents-runtime-token-refresh).
+ */
+export async function runtimeFetch(
+  serverUrl: string, path: string, tokens: TokenSource, init: RequestInit,
+): Promise<Response | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const token = await tokens.get()
+    const res = await fetch(`${serverUrl}/runtime${path}`, {
+      ...init,
+      headers: { ...(init.headers ?? {}), Authorization: `Bearer ${token}` },
+    })
+    if (res.status !== 401) return res
+    // Drain the body so the socket can be reused, then re-mint and retry once.
+    await res.text().catch(() => '')
+    tokens.invalidate()
+  }
+  return null
+}
+
 /** Fire-and-forget runtime call (status / runs). Never throws — observability
  *  must never break the agent loop. */
 async function runtimeBest(
-  serverUrl: string, path: string, token: string, body: unknown,
+  serverUrl: string, path: string, tokens: TokenSource, body: unknown,
 ): Promise<unknown> {
   try {
-    const res = await fetch(`${serverUrl}/runtime${path}`, {
+    const res = await runtimeFetch(serverUrl, path, tokens, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     })
-    return res.ok ? await res.json().catch(() => null) : null
+    return res?.ok ? await res.json().catch(() => null) : null
   } catch { return null }
 }
 
 async function runtimeGet<T>(
-  serverUrl: string, path: string, token: string,
+  serverUrl: string, path: string, tokens: TokenSource,
 ): Promise<T | null> {
   try {
-    const res = await fetch(`${serverUrl}/runtime${path}`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-    })
-    return res.ok ? await res.json().catch(() => null) as T | null : null
+    const res = await runtimeFetch(serverUrl, path, tokens, { method: 'GET' })
+    return res?.ok ? await res.json().catch(() => null) as T | null : null
   } catch { return null }
 }
 
@@ -656,7 +700,7 @@ class HopReporter {
   private readonly MAX_BUFFER = 500
   constructor(
     private readonly serverUrl: string,
-    private readonly getToken: () => Promise<string>,
+    private readonly tokens: TokenSource,
   ) {}
 
   push(hop: PendingHop): void {
@@ -690,14 +734,12 @@ class HopReporter {
       const arr = byHourceSource.get(h.source) ?? []
       arr.push(h); byHourceSource.set(h.source, arr)
     }
-    let token: string
-    try { token = await this.getToken() } catch { /* token unavailable — drop, daemon recovers */ return }
     await Promise.all([...byHourceSource.entries()].map(([source, hops]) =>
       // daemonVersion lets the operator correlate spend / cache patterns with
       // an agent-cli release in the Observability dashboard. One version per
       // batch — daemons never upgrade mid-batch, so every hop in this group
       // shares it on the server side.
-      runtimeBest(this.serverUrl, '/llm-calls', token, { source, hops, daemonVersion: CURRENT_VERSION }),
+      runtimeBest(this.serverUrl, '/llm-calls', this.tokens, { source, hops, daemonVersion: CURRENT_VERSION }),
     ))
   }
 
@@ -712,6 +754,19 @@ class HopReporter {
 class AgentRunner {
   private token = ''
   private tokenExpiresAt = 0
+  /** In-flight mint, so concurrent callers share one POST /runtime-token. */
+  private tokenMint: Promise<string> | null = null
+  /**
+   * The handle every runtime call takes instead of a token string. Passing this
+   * (not `this.token`) is what keeps a turn that outlives its 2h JWT alive:
+   * `get()` re-mints near expiry, and `invalidate()` on a 401 forces a re-mint
+   * on the retry — so neither mid-turn expiry nor a server restart with a new
+   * AGENT_RUNTIME_SECRET can silently starve the run's heartbeat.
+   */
+  private readonly tokens: TokenSource = {
+    get: () => this.ensureToken(),
+    invalidate: () => { this.token = ''; this.tokenExpiresAt = 0 },
+  }
   private home: string
   private binDir: string
   private sessionFile: string
@@ -784,7 +839,7 @@ class AgentRunner {
 
   private get reporter(): HopReporter {
     if (!this.hopReporter) {
-      this.hopReporter = new HopReporter(this.cfg.serverUrl, async () => this.ensureToken())
+      this.hopReporter = new HopReporter(this.cfg.serverUrl, this.tokens)
     }
     return this.hopReporter
   }
@@ -942,6 +997,14 @@ class AgentRunner {
 
   private async ensureToken(): Promise<string> {
     if (this.token && Date.now() < this.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) return this.token
+    // Coalesce concurrent mints. A mid-turn 401 invalidates the token while
+    // several runtime calls (heartbeat + typing + thinking/mark) are in flight;
+    // without this each would POST its own /runtime-token.
+    this.tokenMint ??= this.mintToken().finally(() => { this.tokenMint = null })
+    return this.tokenMint
+  }
+
+  private async mintToken(): Promise<string> {
     const minted = await api<{ token: string; expiresInSeconds: number }>(
       this.cfg.serverUrl, `/api/agents/${this.agent.id}/runtime-token`,
       { method: 'POST', headers: { Authorization: `Bearer ${this.cfg.deviceToken}` }, body: '{}' },
@@ -1009,24 +1072,45 @@ class AgentRunner {
   /** Keep a long engine turn alive: bump the run's updated_at every RUN_HEARTBEAT_MS
    *  so the server's 10-min stale-run sweeper doesn't reap a legitimately long turn
    *  as "orphaned". Fires once immediately, then on an interval. Returns a stop fn
-   *  for the turn's finally block. No-op (and no timer) when there's no run id. */
-  private beatRun(token: string, runId: string | undefined): () => void {
+   *  for the turn's finally block. No-op (and no timer) when there's no run id.
+   *
+   *  Auth is resolved per beat (`this.tokens`, not a captured string): a turn can
+   *  easily outlive the 2h runtime JWT it started with, and a stale token 401s
+   *  every beat — which is exactly the sweeper's "no heartbeat" condition. We
+   *  also LOG a run of failed beats: the previous silent version meant an
+   *  orphaned run was only discoverable from the server's access log. */
+  private beatRun(runId: string | undefined): () => void {
     if (!runId) return () => { /* nothing to heartbeat */ }
-    const beat = (): void => { void runtimeBest(this.cfg.serverUrl, `/runs/${runId}/heartbeat`, token, {}) }
-    beat()
-    const timer = setInterval(beat, RUN_HEARTBEAT_MS)
+    let misses = 0
+    const beat = async (): Promise<void> => {
+      // runtimeFetch, not runtimeBest: we need the HTTP status, and a body-less
+      // 200 would be indistinguishable from a failure by return value alone.
+      const res = await runtimeFetch(this.cfg.serverUrl, `/runs/${runId}/heartbeat`, this.tokens, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      }).catch(() => null)
+      if (res?.ok) { misses = 0; return }
+      misses++
+      // The sweeper reaps at 10 min; warn well before that so the operator sees
+      // the cause in the daemon log rather than an unexplained 'orphaned' run.
+      if (misses === 3) {
+        console.warn(`[computer] ${this.agent.id} run ${runId} heartbeat failed ${misses}x (last status ${res?.status ?? 'network error'}) — the server may reap this run as orphaned`)
+      }
+    }
+    void beat()
+    const timer = setInterval(() => { void beat() }, RUN_HEARTBEAT_MS)
     return () => clearInterval(timer)
   }
 
   private async publishEngineFailure(args: {
-    token: string
     runId?: string
     conversationId: string | null
     error: string
     exitCode: number
   }): Promise<void> {
     if (args.runId) {
-      await runtimeBest(this.cfg.serverUrl, '/events', args.token, {
+      await runtimeBest(this.cfg.serverUrl, '/events', this.tokens, {
         runId: args.runId,
         kind: 'engine.failed',
         level: 'error',
@@ -1036,8 +1120,8 @@ class AgentRunner {
       })
     }
     const hint = authFailureHint(this.adapter.id, args.error)
-    const conversationIds = await this.failureConversationIds(args.token, args.conversationId)
-    await Promise.all(conversationIds.map((conversationId) => runtimeBest(this.cfg.serverUrl, '/notices', args.token, {
+    const conversationIds = await this.failureConversationIds(args.conversationId)
+    await Promise.all(conversationIds.map((conversationId) => runtimeBest(this.cfg.serverUrl, '/notices', this.tokens, {
       conversationId,
       agentId: this.agent.id,
       noticeKind: 'byoa_engine_failed',
@@ -1047,12 +1131,12 @@ class AgentRunner {
     })))
   }
 
-  private async failureConversationIds(token: string, conversationId: string | null): Promise<string[]> {
+  private async failureConversationIds(conversationId: string | null): Promise<string[]> {
     if (conversationId) return [conversationId]
     // PROBE: we're only looking up convo ids to notify of an engine failure —
     // we don't show these messages to the agent. Use ?probe=1 so the server
     // does NOT advance the freshness-preflight baseline for this read.
-    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox?probe=1', token)
+    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox?probe=1', this.tokens)
     const ids = new Set<string>()
     for (const row of inbox?.rows ?? []) {
       if (typeof row.conversation_id === 'string' && row.conversation_id) ids.add(row.conversation_id)
@@ -1078,8 +1162,8 @@ class AgentRunner {
    *  engine's cheap fast model (Claude Haiku), NOT a cloud call. The server only
    *  builds the prompt (it has the DB for inbox+context); inference is 100%
    *  local: no network model hop, no sub2api quota (429/503), no big brain. */
-  private async inboxTriage(token: string): Promise<RuntimeInboxTriageResponse | null> {
-    const payload = await runtimeGet<RuntimeTriagePayload>(this.cfg.serverUrl, '/inbox-triage/payload', token)
+  private async inboxTriage(): Promise<RuntimeInboxTriageResponse | null> {
+    const payload = await runtimeGet<RuntimeTriagePayload>(this.cfg.serverUrl, '/inbox-triage/payload', this.tokens)
     if (!payload) return null
     if (payload.verdict) return payload.verdict // hard rule / empty inbox — no model needed
     if (!payload.instructions || !payload.input) return null
@@ -1162,7 +1246,7 @@ class AgentRunner {
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
       // LOCAL + cold-session — its input is uncached, the cost this ledger exists
       // to weigh. usage is present for claude (json output), absent for codex.
-      void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage)
+      void this.recordTriageUsage(verdict.actionable, verdict.reason, res.usage)
       return verdict
     }
     if (payload.failClosed) {
@@ -1191,8 +1275,8 @@ class AgentRunner {
 
   /** Post one local-triage record to the cost ledger. Best-effort. `usage` is the
    *  engine's raw breakdown (claude); undefined → recorded as unmeasured (codex). */
-  private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage): Promise<void> {
-    await runtimeBest(this.cfg.serverUrl, '/triage', token, {
+  private async recordTriageUsage(actionable: boolean, reason: string, usage?: EngineUsage): Promise<void> {
+    await runtimeBest(this.cfg.serverUrl, '/triage', this.tokens, {
       source: `byoa-${this.adapter.id}`,
       model: this.triageModel(),
       actionable,
@@ -1229,8 +1313,8 @@ class AgentRunner {
     } catch { return null }
   }
 
-  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean }> {
-    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
+  private async snapshotUnread(): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean }> {
+    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', this.tokens)
     const seen = new Map<string, string>()
     const lines: string[] = []
     // `hasReal` = is ANY unread a genuine human/agent message (not a system
@@ -1281,10 +1365,10 @@ class AgentRunner {
    *  read the room and chose silence) does not re-trigger on the same messages
    *  every INBOX_POLL_MS. markConversationRead is monotonic, so this never
    *  regresses a cursor the engine already advanced further via `cumora reply`. */
-  private async ackSeen(token: string, seen: Map<string, string>): Promise<void> {
+  private async ackSeen(seen: Map<string, string>): Promise<void> {
     if (seen.size === 0) return
     await Promise.all([...seen].map(([conversationId, upToMessageId]) =>
-      runtimeBest(this.cfg.serverUrl, '/conversation/mark-read', token, { conversationId, upToMessageId }),
+      runtimeBest(this.cfg.serverUrl, '/conversation/mark-read', this.tokens, { conversationId, upToMessageId }),
     ))
   }
 
@@ -1426,7 +1510,7 @@ class AgentRunner {
    *  of the cloud idle scheduler's agenda heartbeat. Gated by a quiet window (the
    *  anti-loop) + a throttle so the 20s poll doesn't hammer it. Runs through the
    *  SAME persistent engine; isolated from the chat path so it can't break it. */
-  private async maybeAgendaTurn(token: string): Promise<void> {
+  private async maybeAgendaTurn(): Promise<void> {
     const now = Date.now()
     if (now - this.lastTurnEndedAt < AGENDA_QUIET_MS) return
     if (now - this.lastAgendaCheckAt < AGENDA_CHECK_MS) return
@@ -1442,19 +1526,19 @@ class AgentRunner {
       return
     }
     const ag = await runtimeGet<{ actionable?: boolean; brief?: string; focus?: string }>(
-      this.cfg.serverUrl, '/agenda', token,
+      this.cfg.serverUrl, '/agenda', this.tokens,
     )
     if (!ag?.actionable || !ag.brief) return
     console.log(`[computer] ${this.agent.id} agenda turn START — proactive board work${ag.focus ? `: ${ag.focus.slice(0, 80)}` : ''}`)
-    await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'thinking' })
-    const run = (await runtimeBest(this.cfg.serverUrl, '/runs', token, {
+    await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'thinking' })
+    const run = (await runtimeBest(this.cfg.serverUrl, '/runs', this.tokens, {
       trigger: { source: 'byoa-agenda', engine: this.adapter.id },
     })) as { runId?: string } | null
     // Pin the per-hop ledger's `runId` for the lifetime of this turn so every
     // hop emitted by the engine is linked back to the agent_runs row. Cleared
     // in finally below alongside the heartbeat stop.
     this.currentRunId = run?.runId ?? null
-    const stopRunBeat = this.beatRun(token, run?.runId)
+    const stopRunBeat = this.beatRun(run?.runId)
     let exitCode = 0
     let engineError: string | null = null
     let turnUsage: EngineUsage | undefined
@@ -1469,7 +1553,7 @@ class AgentRunner {
     try {
       const [memoryDigest, roster] = await Promise.all([
         this.memoryDigest(),
-        runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
+        runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', this.tokens).then((r) => r?.roster ?? '').catch(() => ''),
       ])
       const resumeSessionId = this.sessionId
       const session = this.ensureEngineSession()
@@ -1507,7 +1591,7 @@ class AgentRunner {
       // wraps because a slow flush must not block the chat path.
       this.currentRunId = null
       void this.reporter.flush()
-      await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+      await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'avail' })
       // Mirror chat path: release the concurrency slot regardless of outcome.
       bigBrainSem.release()
     }
@@ -1516,7 +1600,7 @@ class AgentRunner {
     // proactive; next heartbeat re-evaluates after cooldown).
     const agendaRateLimited = engineError ? isRateLimited(engineError) : false
     if (engineError && !agendaRateLimited) {
-      await this.publishEngineFailure({ token, runId: run?.runId, conversationId: null, error: engineError, exitCode })
+      await this.publishEngineFailure({ runId: run?.runId, conversationId: null, error: engineError, exitCode })
     }
     if (engineError && agendaRateLimited) {
       this.engineBackoffUntil = Date.now() + ENGINE_BACKOFF_AFTER_RATE_LIMIT_MS
@@ -1530,7 +1614,7 @@ class AgentRunner {
     // stale-run sweeper reaps EVERY agenda turn as "orphaned" (the bug behind the
     // recurring Failed/orphaned runs), no matter how fast the turn actually was.
     if (run?.runId) {
-      await runtimeBest(this.cfg.serverUrl, `/runs/${run.runId}/finish`, token, {
+      await runtimeBest(this.cfg.serverUrl, `/runs/${run.runId}/finish`, this.tokens, {
         status: exitCode === 0 ? 'completed' : 'failed',
         summary: engineError ?? `byoa-agenda ${this.adapter.id} run (exit ${exitCode})`,
         error: engineError,
@@ -1595,7 +1679,7 @@ class AgentRunner {
       // the actual steer text, and any duplicate-collision risk remains
       // protected by cmdReply's preflight against the baseline that
       // snapshotUnread set at the start of this turn.
-      const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox?probe=1', this.token)
+      const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox?probe=1', this.tokens)
       const rows = (inbox?.rows ?? []).filter((r) => r.conversation_id === convo)
       if (rows.length === 0) return
       const direct = rows.some((r) =>
@@ -1671,8 +1755,10 @@ class AgentRunner {
           break
         }
         const turnStart = Date.now()
+        // Mint up front (not to capture the string — every runtime call below
+        // resolves `this.tokens` per request — but so a broken mint fails the turn
+        // HERE, and so the engine's env + `.runtime-token` file start out valid.)
         await this.ensureToken()
-        const token = this.token
         // Consume the wake's conversation: only a turn driven by a fresh wake
         // FOR a conversation shows a "typing…" indicator there. Clearing it
         // means a reconnect/cold-start catch-up turn (which reuses no wake)
@@ -1683,7 +1769,7 @@ class AgentRunner {
         // superset of what we may ack — a real task that lands during/after
         // triage keeps a higher id, stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
-        const { seen, digest, hasReal } = await this.snapshotUnread(token)
+        const { seen, digest, hasReal } = await this.snapshotUnread()
         // HARD COST GATE (content-blind, fail-closed): if nothing unread is a
         // real human/agent message — empty, or system-only relays/status/
         // membership notices — NEVER run triage and NEVER spawn the big engine.
@@ -1693,16 +1779,16 @@ class AgentRunner {
         // that otherwise woke opus on every ~20s poll). The big brain is for
         // real content only — under no circumstances spend it on system noise.
         if (!hasReal) {
-          await this.ackSeen(token, seen)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await this.ackSeen(seen)
+          await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'avail' })
           // No per-tick log: this is the idle steady state (every poll × agent),
           // same reasoning as the 'inbox empty' skip below.
           // Chat is idle → maybe there's assigned BOARD work to proactively pick up
           // (quiet+throttle gated, so this isn't a per-poll cost).
-          await this.maybeAgendaTurn(token)
+          await this.maybeAgendaTurn()
           continue
         }
-        const triage = await this.inboxTriage(token)
+        const triage = await this.inboxTriage()
         const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
         // Triage was rate-limited → STOP. Do NOT retry, do NOT wake the big brain,
         // do NOT ack (the message is retried after the cooldown). Back off
@@ -1713,7 +1799,7 @@ class AgentRunner {
           const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
           this.triageBackoffUntil = Date.now() + backoff
           console.warn(`[computer] ${this.agent.id} triage RATE-LIMITED (#${this.triageTroubleStreak}, triage ${triageMs}ms) — backing off ${Math.round(backoff / 1000)}s, NOT waking the big brain, not acking`)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'avail' })
           break
         }
         // FAIL-OPEN is a triage FAILURE, not a confirmed real task — so it must
@@ -1726,7 +1812,7 @@ class AgentRunner {
           const backoff = Math.min(10 * 60_000, 30_000 * 2 ** (this.triageTroubleStreak - 1))
           this.triageBackoffUntil = Date.now() + backoff
           console.warn(`[computer] ${this.agent.id} triage FAIL-OPEN (#${this.triageTroubleStreak}, triage ${triageMs}ms) — NOT waking the big brain, backing off ${Math.round(backoff / 1000)}s, not acking`)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'avail' })
           break
         }
         // A clean, usable triage clears any prior backoff.
@@ -1743,10 +1829,10 @@ class AgentRunner {
           // Ack the chatter the small brain just dismissed. Without this the
           // unread sticks and the INBOX_POLL_MS drain re-triages it forever —
           // the loop that woke (or nearly woke) the big brain on every tick.
-          await this.ackSeen(token, seen)
-          await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+          await this.ackSeen(seen)
+          await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'avail' })
           // Chat had nothing for us → maybe proactively pick up assigned board work.
-          await this.maybeAgendaTurn(token)
+          await this.maybeAgendaTurn()
           continue
         }
         // Mirror the cloud agent EXACTLY (turn.ts): the small brain ONLY gated
@@ -1760,13 +1846,13 @@ class AgentRunner {
         // was the divergence that broke chains and is GONE. Cost backstops remain:
         // the actionable gate above + the per-minute activation rate floor.
         console.log(`[computer] ${this.agent.id} turn START (${reason}) — triage ${triageMs}ms, spawning ${this.adapter.id}${convo ? ` for ${convo}` : ''}`)
-        await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'thinking' })
+        await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'thinking' })
         // "<agent> is typing…" in the conversation that woke us, refreshed
         // while the engine works (BYOA runs can be long), cleared at the end.
         let typingTimer: ReturnType<typeof setInterval> | undefined
         if (convo) {
-          const ping = (): void => { void runtimeBest(this.cfg.serverUrl, '/typing', token, { conversationId: convo, done: false }) }
-          const thinkingPing = (): void => { void runtimeBest(this.cfg.serverUrl, '/thinking/mark', token, { conversationIds: [convo], ttlSec: 60 }) }
+          const ping = (): void => { void runtimeBest(this.cfg.serverUrl, '/typing', this.tokens, { conversationId: convo, done: false }) }
+          const thinkingPing = (): void => { void runtimeBest(this.cfg.serverUrl, '/thinking/mark', this.tokens, { conversationIds: [convo], ttlSec: 60 }) }
           ping()
           thinkingPing()
           typingTimer = setInterval(() => {
@@ -1782,13 +1868,13 @@ class AgentRunner {
           // drafted 光, and the second glance silently advanced past the
           // first poster's message; preflight previously saw "nothing newer."
         }
-        const run = (await runtimeBest(this.cfg.serverUrl, '/runs', token, {
+        const run = (await runtimeBest(this.cfg.serverUrl, '/runs', this.tokens, {
           trigger: { source: 'byoa', engine: this.adapter.id },
         })) as { runId?: string } | null
         // Pin runId so per-hop ledger rows link back to this turn (see
         // maybeAgendaTurn for the same hook).
         this.currentRunId = run?.runId ?? null
-        const stopRunBeat = this.beatRun(token, run?.runId)
+        const stopRunBeat = this.beatRun(run?.runId)
         const controller = new AbortController()
         let exitCode = 0
         let engineError: string | null = null
@@ -1816,7 +1902,7 @@ class AgentRunner {
             // server so a locally-run agent knows WHO its teammates are and what
             // each does — the cloud agent gets this in its system prompt. Only
             // fetched here, right before a real turn, so no-op wakes pay nothing.
-            runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
+            runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', this.tokens)
               .then((r) => r?.roster ?? '').catch(() => ''),
           ])
           const resumeSessionId = this.sessionId
@@ -1878,8 +1964,8 @@ class AgentRunner {
           this.currentRunId = null
           void this.reporter.flush()
           if (convo) {
-            await runtimeBest(this.cfg.serverUrl, '/typing', token, { conversationId: convo, done: true })
-            await runtimeBest(this.cfg.serverUrl, '/thinking/unmark', token, { conversationIds: [convo] })
+            await runtimeBest(this.cfg.serverUrl, '/typing', this.tokens, { conversationId: convo, done: true })
+            await runtimeBest(this.cfg.serverUrl, '/thinking/unmark', this.tokens, { conversationIds: [convo] })
           }
           // Release the semaphore slot regardless of success / error — the
           // next queued agent can now spawn. MUST be in the same finally
@@ -1897,7 +1983,6 @@ class AgentRunner {
         const rateLimited = engineError ? isRateLimited(engineError) : false
         if (engineError && !rateLimited) {
           await this.publishEngineFailure({
-            token,
             runId: run?.runId,
             conversationId: convo,
             error: engineError,
@@ -1923,7 +2008,7 @@ class AgentRunner {
           spawnPacer.onOk()
         }
         if (run?.runId) {
-          await runtimeBest(this.cfg.serverUrl, `/runs/${run.runId}/finish`, token, {
+          await runtimeBest(this.cfg.serverUrl, `/runs/${run.runId}/finish`, this.tokens, {
             status: exitCode === 0 ? 'completed' : 'failed',
             summary: rateLimited ? `rate-limited (deferred for retry)` : (engineError ?? `byoa ${this.adapter.id} run (exit ${exitCode})`),
             error: rateLimited ? null : engineError,
@@ -1936,8 +2021,8 @@ class AgentRunner {
         // read the room and chose silence, this is what stops the same inbox
         // from re-waking the big brain on the next drain. On engine FAILURE we
         // skip the ack so the unread survives for a retry / next wake.
-        if (!engineError) await this.ackSeen(token, seen)
-        await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
+        if (!engineError) await this.ackSeen(seen)
+        await runtimeBest(this.cfg.serverUrl, '/status', this.tokens, { status: 'avail' })
         // A chat turn resets the "quiet" anchor: an agent that just acted in chat
         // isn't immediately pulled into an agenda turn (mirrors the cloud idle
         // scheduler only picking agents quiet for N minutes).
