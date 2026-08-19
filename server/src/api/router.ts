@@ -5,6 +5,7 @@ import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
+import { extractJsonObject } from '../agents/llm-json.js'
 import { getTriageEconomics } from '../agents/observability.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { notifyMessage, computeMessageRecipients } from '../push.js'
@@ -2195,7 +2196,7 @@ ${systemPrompt.slice(0, 500) || '(none)'}`,
       max_output_tokens: 200,
       reasoning: { effort: 'low' },
     })
-    const parsed = JSON.parse(r.output_text ?? '{}') as { gender?: string }
+    const parsed = JSON.parse(extractJsonObject(r.output_text ?? '{}')) as { gender?: string }
     if (parsed.gender === 'feminine' || parsed.gender === 'masculine' || parsed.gender === 'androgynous') {
       return parsed.gender
     }

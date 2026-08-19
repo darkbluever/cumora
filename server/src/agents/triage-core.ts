@@ -20,6 +20,7 @@
  *   - BYOA daemon: server builds the request (it has DB), daemon runs its LOCAL
  *     small model on it and parses here. The big brain is NEVER spent on triage.
  */
+import { extractJsonObject } from './llm-json.js'
 import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
 
 /** A COARSE routing hint the gate emits when actionable=true. It is NOT acted on
@@ -117,16 +118,10 @@ export function isRateLimited(errorText: string): boolean {
 }
 
 /** Pull the JSON object out of a model's raw text: tolerate ```json fences and
- *  any chatter before/after the object (a small local model is chattier than a
- *  json_object-constrained cloud call). This PARSES the model's answer — it does
- *  not make a triage decision. */
-function extractJsonObject(raw: string): string {
-  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  const body = fenced ? fenced[1] : raw
-  const start = body.indexOf('{')
-  const end = body.lastIndexOf('}')
-  return start >= 0 && end > start ? body.slice(start, end + 1) : body.trim()
-}
+ *  any chatter before/after the object. Shared with every other classifier that
+ *  parses a model's JSON answer — see `llm-json.ts` for why it is not private
+ *  to this module any more. This PARSES the model's answer — it does not make a
+ *  triage decision. */
 
 export function parseTriage(raw: string): Omit<InboxTriageVerdict, 'source'> | null {
   try {

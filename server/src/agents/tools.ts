@@ -20,6 +20,7 @@
 import { randomUUID } from 'node:crypto'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
+import { extractJsonObject } from './llm-json.js'
 import { pool } from '../db/pool.js'
 import { tReadFile, tWriteFile, tEditFile } from './runtime/native-tools.js'
 import type { FsNamespace } from './runtime/fs-namespace.js'
@@ -277,7 +278,7 @@ async function tPalette(args: Record<string, unknown>, companyId: string | null,
   const text = r.output_text ?? '{}'
   let colors: string[] = []
   try {
-    const parsed = JSON.parse(text) as { colors?: string[] }
+    const parsed = JSON.parse(extractJsonObject(text)) as { colors?: string[] }
     colors = (parsed.colors ?? []).filter((c) => /^#[0-9A-Fa-f]{6}$/.test(c)).slice(0, 5)
   } catch { /* ignore */ }
   return {

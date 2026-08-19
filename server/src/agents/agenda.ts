@@ -30,6 +30,7 @@
 import { pool } from '../db/pool.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
+import { extractJsonObject } from './llm-json.js'
 import { redis } from '../redis.js'
 
 /** A Kanban card that the agent should plausibly act on. */
@@ -436,7 +437,11 @@ Reply as strict JSON.`
       max_output_tokens: 300,
       reasoning: { effort: 'low' },
     })
-    const parsed = JSON.parse(r.output_text ?? '{}') as {
+    // `json_object` above is advisory behind an OpenAI-compatible shim — the
+    // answer can arrive in a ```json fence. Recover the object before parsing,
+    // or this throws on every single heartbeat and the fallback below becomes
+    // the only branch that ever runs.
+    const parsed = JSON.parse(extractJsonObject(r.output_text ?? '{}')) as {
       actionable?: unknown; focus?: unknown; reason?: unknown
     }
     // Coerce to a real boolean *strictly*. `Boolean("no")` is `true`

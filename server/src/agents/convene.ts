@@ -1,4 +1,5 @@
 import { getTrackedLlmClient } from './llm-ledger.js'
+import { extractJsonObject } from './llm-json.js'
 import type { ResponseInputItem } from 'openai/resources/responses/responses'
 import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
@@ -270,7 +271,7 @@ async function classifyDecision(args: { sessionId: string; topic: string }): Pro
       max_output_tokens: 1200,
       reasoning: { effort: 'low' },
     })
-    const parsed = JSON.parse(r.output_text ?? '{}') as { reached?: boolean; headline?: string; body?: string }
+    const parsed = JSON.parse(extractJsonObject(r.output_text ?? '{}')) as { reached?: boolean; headline?: string; body?: string }
     if (parsed.reached && parsed.headline && parsed.body) {
       return { headline: parsed.headline, body: parsed.body }
     }

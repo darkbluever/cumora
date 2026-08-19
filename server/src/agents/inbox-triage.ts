@@ -1,6 +1,7 @@
 import type { ContextRow, InboxRow, PersonaRow, WorklogEntry } from './runtime/client.js'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
+import { extractJsonObject } from './llm-json.js'
 import { inprocClient } from './runtime/inproc-client.js'
 import { buildTriageRequest, parseTriage, finalizeTriage, isRateLimited, type InboxTriageVerdict, type ClaimsByConvo } from './triage-core.js'
 import { recordTriage } from './observability.js'
@@ -174,7 +175,7 @@ export async function gateSyntheticWake(args: {
       max_output_tokens: 300,
       reasoning: { effort: 'low' },
     }, { maxRetries: 0, timeout: 8_000 })
-    const parsed = JSON.parse(r.output_text ?? '{}') as { act?: unknown; reason?: unknown; note?: unknown }
+    const parsed = JSON.parse(extractJsonObject(r.output_text ?? '{}')) as { act?: unknown; reason?: unknown; note?: unknown }
     return {
       act: parsed.act === true,
       reason: typeof parsed.reason === 'string' ? parsed.reason.slice(0, 300) : '',
